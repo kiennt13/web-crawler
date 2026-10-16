@@ -20,6 +20,7 @@ class AsyncCrawler():
         self,
         base_url: str,
         max_concurrency: int = 3,
+        max_pages: int = 10
     ) -> None:
         self.base_url = base_url
         self.base_domain: str = urlsplit(base_url).netloc
@@ -29,6 +30,9 @@ class AsyncCrawler():
         self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.session: aiohttp.ClientSession | None = None
+        self.max_pages: int = max_pages
+        self.should_stop: bool = False
+        self.all_tasks: set = set()
 
 
     async def __aenter__(self) -> object:
@@ -43,6 +47,12 @@ class AsyncCrawler():
     async def add_page_visit(self, normalized_url: str):
         async with self.lock:
             if normalized_url in self.visited:
+                return False
+            if self.should_stop is True:
+                return False
+            if len(self.visited) >= self.max_pages:
+                self.should_stop = True
+                print("Reached maximum number of pages to crawl")
                 return False
             self.visited.add(normalized_url)
             return True
@@ -69,6 +79,9 @@ class AsyncCrawler():
 
 
     async def crawl_page(self, current_url: str | None = None) -> None:
+        if self.should_stop is True:
+            return
+        
         normalized_current_url = normalize_url(current_url)
         if urlsplit(current_url).netloc != self.base_domain:
             return
@@ -83,16 +96,24 @@ class AsyncCrawler():
             return
         print(f"Crawling from {current_url}")
         extract_result = extract_page_data(html, current_url)
-        
+                
         async with self.lock:
             self.page_data[normalized_current_url] = extract_result
+
+        if self.should_stop is True:
+            return
         
         tasks = []
-        for url in self.page_data[normalized_current_url]["outgoing_links"]:
+        for url in self.page_data[normalized_current_url]["outgoing_links"]: 
             task = asyncio.create_task(self.crawl_page(url))
             tasks.append(task)
+            self.all_tasks.add(task)
         if tasks:
-            await asyncio.gather(*tasks)
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for task in tasks:
+                    self.all_tasks.discard(task)
         return
 
 
@@ -101,8 +122,8 @@ class AsyncCrawler():
         return self.page_data
 
 
-async def crawl_site_async(url: str, max_concurrency: int = 3) -> dict[str, PageData]:
-    async with AsyncCrawler(url, max_concurrency) as crawler:
+async def crawl_site_async(url: str, max_concurrency: int = 3, max_pages: int = 10) -> dict[str, PageData]:
+    async with AsyncCrawler(url, max_concurrency, max_pages) as crawler:
         await crawler.crawl()
         return crawler.page_data
 
@@ -111,11 +132,18 @@ def arg_check() -> None:
     if len(sys.argv) < 2:
         print("no website provided")
         sys.exit(1)
-    elif len(sys.argv) > 2:
+    elif len(sys.argv) > 4:
         print("too many arguments provided")
         sys.exit(1)
     else:
+        try:
+            max_concurrency = int(sys.argv[2])
+            max_pages = int(sys.argv[3])
+        except ValueError:
+            print("invalid max concurrency or max pages value")
+            sys.exit(1)
         print(f"starting crawl of: {sys.argv}")
+        return max_concurrency, max_pages
 
 
 def normalize_url(url: str) -> str:
